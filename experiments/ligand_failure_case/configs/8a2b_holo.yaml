@@ -1,0 +1,45 @@
+# Generator for the 8a2b holo state (EGFR kinase + KY9), guided_alphafold's Protenix sampler.
+# model_manager values are copied from the repo's generated_configurations/*_holo_*.yaml.
+# Relative paths resolve against the repo root (run_guidance.sbatch cds there).
+general:
+  name: 8a2b_holo_density_guided
+  seed: 101                 # same seed as the earlier Protenix-v1 unguided run of 8a2b
+  batch_size: 5             # 5 samples, like the Protenix-v1 unguided outputs
+protein:
+  pdb_id: 8a2b_holo         # MSA cache: ./alignment_dir/8a2b_holo
+  sequences:
+  - sequence: ALLRILKETEFKKIKVLGSGAFGTVYKGLWIPEGEKVKIPVAIKELREATSPKANKEILDEAYVMASVDNPHVCRLLGICLTSTVQLITQLMPFGCLLDYVREHKDNIGSQYLLNWCVQIAKGMNYLEDRRLVHRDLAARNVLVKTPQHVKITDFGRAKLLGAEEKEYHAEGGKVPIKWMALESILHRIYTHQSDVWSYGVTVWELMTFGSKPYDGIPASEISSILEKGERLPQPPICTIDVYMIMRKCWMIDADSRPKFRELIIEFSKMARDPQRYLVIQGDERMHLP
+    count: 1
+    sequence_type: proteinChain
+  - sequence: CCD_KY9
+    count: 1
+    sequence_type: ligand
+  chains_to_use: [0, 1]
+  should_align_to_chains: [0, 1]
+  residue_range: null
+  reference_pdb: null
+  contains_missing_atoms: true
+  assembly_identifier: null
+model_manager:
+  N_cycle: 10
+  chunk_size: 256
+  diffusion_N: 200
+  gamma0: 0.8
+  gamma_min: 1.0
+  noise_scale_lambda: 1.003
+  step_scale_eta: 1.0
+  msa_save_dir: ./alignment_dir
+  msa_embedding_cache_dir: ./msa_cache
+  model_checkpoint_path: ./src/af3-dev/release_model/model_v0.2.0.pt
+  dump_dir: proteniX_output
+  use_msa: true
+  pairformer_mixed_precision: true
+diffusion_process:
+  guidance:
+    # the repo's X-ray (density) baseline, pipeline_configurations/xray_baseline.yaml:
+    # effective strength step_size * scale = 0.1. (0.3, from the repo's RMSD configs, diverged
+    # here at step ~65-90 -- kept in outputs_scale0.3_diverged/.)
+    step_size: 0.1
+    guidance_direction_scale_factor: 1.0
+    normalize_gradients: true
+    start_guidance_from: 0                 # xray_baseline denoiser_time_index: guide i > 0, not the last
