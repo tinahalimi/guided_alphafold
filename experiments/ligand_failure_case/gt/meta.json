@@ -1,0 +1,59 @@
+{
+  "resolution": 1.69,
+  "spacing": 0.5633333333333334,
+  "rmax": 3.5,
+  "box_pad": 4.5,
+  "grid_origin": [
+    -30.42,
+    -60.84,
+    -29.85666666666667
+  ],
+  "grid_shape": [
+    104,
+    116,
+    133
+  ],
+  "n_voxels": 1604512,
+  "ligand": "KY9",
+  "n_protein_atoms": 2212,
+  "n_ligand_atoms": 48,
+  "pocket_residues": [
+    723,
+    726,
+    743,
+    744,
+    745,
+    747,
+    748,
+    749,
+    750,
+    755,
+    758,
+    759,
+    762,
+    763,
+    766,
+    775,
+    776,
+    777,
+    788,
+    789,
+    790,
+    854,
+    855,
+    856,
+    858
+  ],
+  "pocket_cutoff": 5.0,
+  "apo_superposition": {
+    "n_common_ca": 269,
+    "n_fit": 193,
+    "ca_rmsd_core": 0.5962159298544453,
+    "ca_rmsd_all": 3.6229211644504904,
+    "ca_rmsd_pocket": 3.769553962442497
+  },
+  "checks": {
+    "forward_vs_repo_max_abs_diff": 0.0,
+    "ccp4_roundtrip_max_abs_diff": 2.288818359375e-05
+  }
+}
