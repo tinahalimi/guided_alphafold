@@ -10,6 +10,11 @@ This codebase implements a guided protein structure prediction pipeline that inc
 
 The pipeline processes experimental data, runs experiment-guided structure prediction, performs structural relaxation using AMBER99 force field, and evaluates results using modality-specific metrics.
 
+A fourth modality, **RMSD**, is an oracle control rather than an experiment: it guides on the
+coordinate deviation from a known reference structure. It exists to validate the guidance
+loop and to establish the best-case RMSD the sampler can reach when the likelihood is
+perfect. See [RMSD guidance](#4-rmsd-guided-structure-prediction-oracle-control).
+
 ## Installation
 
 ### Environment Setup
@@ -463,6 +468,237 @@ Both modes write:
 
 `<id>_ensemble.pdb` is the primary output. The per-structure files and their
 hydrogenated and relaxed derivatives are kept under `verbose/`.
+
+### 4. RMSD Guided Structure Prediction (oracle control)
+
+Guides on the coordinate deviation between the structure being generated and a reference
+structure, instead of an experimental measurement. There is nothing to model and nothing to
+fit -- the objective is the answer itself. Two uses:
+
+- check that the guidance machinery works end to end: loss -> gradient on the noisy
+  coordinates -> denoising step actually moves samples where the loss points;
+- measure the best RMSD the sampler can reach, as an upper bound on what any real
+  experimental likelihood could achieve on the same construct.
+
+It is not a structure determination method.
+
+#### Running it
+
+One command prepares the inputs and runs the guided/unguided pair:
+
+```bash
+python run_rmsd.py \
+    --source-pdb path/to/crystal.pdb \
+    --pdb-id my_complex \
+    --keep-heteroatoms APR \
+    --ligand-specifier CCD_APR --ligand-count 1 \
+    --msa-source-dir path/to/msa \      # optional; queries the MSA server if omitted
+    --run-unguided
+```
+
+Preparation and running can also be split:
+
+```bash
+# 1. clean the reference and write generated_configurations/<id>_rmsd_guided{,_unguided}.yaml
+python -m src.utils.process_pipeline_inputs.preprocess_rmsd_inputs \
+    --source-pdb path/to/crystal.pdb --pdb-id my_complex --keep-heteroatoms APR
+
+# 2. check the correspondence, self-consistency and gradients before spending a run
+python scripts/verify_rmsd_guidance.py generated_configurations/my_complex_rmsd_guided.yaml
+
+# 3. run
+python run_rmsd.py --config generated_configurations/my_complex_rmsd_guided.yaml \
+    --unguided-config generated_configurations/my_complex_rmsd_guided_unguided.yaml \
+    --run-unguided
+```
+
+`scripts/test_rmsd_reference.py` covers the atom map and the ligand-aware entity helpers on
+CPU, with no model weights.
+
+#### Input preparation
+
+`preprocess_rmsd_inputs.py` writes the reference that scoring uses:
+
+- the whole main structure is kept -- every polymer chain at full length, plus the
+  heteroatom residues named by `--keep-heteroatoms`;
+- waters, hydrogens and every other heteroatom are dropped;
+- where a residue has alternate conformations, the **highest-occupancy** conformer is
+  selected per atom name. This is deliberately not gemmi's
+  `remove_alternative_conformations()`, which keeps whichever conformer comes first --
+  frequently the minor one.
+
+> gemmi reports "no alternate conformation" as `'\x00'`, not `''`. An atom in an ordinary
+> single-conformer residue is therefore **truthy**, and a ligand refined at partial
+> occupancy usually carries a real altloc letter -- so a filter written as
+> `if not atom.altloc` drops the ligand. Compare against the sentinel explicitly.
+
+It then reads the composition back out of the cleaned file and fills the config in from it:
+the entity sequences, the chain map, and the ligand's residue offset. Nothing about the
+construct is hardcoded.
+
+#### The atom index map
+
+The correspondence between the model's atom ordering and the reference is built explicitly
+(`src/utils/rmsd_reference.py`), keyed on `(chain, residue number, atom name)`, validated on
+residue name, and cached against the reference file and the model atom ordering it was built
+for. Positional zipping would be wrong even where the atom counts agree: for ADP-ribose the
+model and a crystal file agree on all 36 atom *names* but not on their order.
+
+`chain_map` connects the two numbering schemes. Keys may be the featurizer's chain ids
+(`A0`, `B1`, `C0`) or the plain letters. A value is either a bare reference chain name, or:
+
+```yaml
+chain_map:
+  A: A                                          # protein copy 1 -> reference chain A
+  B: B                                          # protein copy 2 -> reference chain B
+  C: {reference_chain: A, residue_offset: 200}   # ligand: own chain from 1 in the model,
+                                                 # residue 201 of chain A in the crystal
+```
+
+`residue_offset` is added to the model residue number to reach the reference one. A model
+chain with no entry is an error rather than a silently unscored part of the structure
+(`require_all_chains_mapped`).
+
+#### Alignment and scoring sets
+
+Superposition and scoring are independent selections, both defaulting to every mapped atom:
+
+```yaml
+alignment_selection: null    # null means "everything mapped"
+scoring_selection:
+  entity_kinds: [ligand]     # superpose on everything, score the ligand alone
+                             # -> the ligand's pose in its pocket
+```
+
+Selection fields are `model_chains`, `entity_kinds` (`protein`/`ligand`/`dna`/`rna`),
+`atom_names`, and `reference_residue_ranges` (`{chain: [[lo, hi], ...]}`). Every field left
+null widens rather than narrows.
+
+#### Configuration
+
+Everything is in the config -- see `pipeline_configurations/rmsd_baseline.yaml`:
+
+| key | meaning |
+|---|---|
+| `loss_function.rmsd_loss_function.reference_pdb` | reference structure to score against |
+| `loss_function.rmsd_loss_function.chain_map` | model chain -> reference chain (+ residue offset) |
+| `loss_function.rmsd_loss_function.alignment_selection` | atoms to superpose on |
+| `loss_function.rmsd_loss_function.scoring_selection` | atoms to score |
+| `loss_function.rmsd_loss_function.objective` | `rmsd` (loss is in Angstroms) or `msd` |
+| `loss_function.rmsd_loss_function.weight` | weight in the combined loss |
+| `loss_function.rmsd_loss_function.cache_dir` | where the built atom index map is cached |
+| `diffusion_process.guidance.guidance_direction_scale_factor` | guidance strength |
+
+#### Ligands
+
+Protenix handles a CCD ligand natively; a ligand entity is declared alongside the polymers,
+using the same `sequence` field:
+
+```yaml
+sequences:
+  - sequence: "SMVNSFSGYLKL..."
+    count: 2
+    sequence_type: "proteinChain"
+  - sequence: "CCD_APR"
+    count: 1
+    sequence_type: "ligand"
+```
+
+The ligand is a scored, gradient-carrying part of the structure -- not held static and not
+excluded -- and lands in the output PDB as its own chain of HETATM records.
+
+Note that `violation_loss_weight` scores protein stereochemistry only (peptide geometry and
+the amino-acid atom14 layout); non-protein chains are skipped. `bond_length_loss_weight`
+covers all entity types.
+
+#### RMSD output layout
+
+```
+<output_directory>/<id>_rmsd_guided/
+├── diffusion_process/
+│   ├── <id>_0.pdb ... <id>_N.pdb    # the ensemble, protein chains + ligand chain
+│   └── rmsd_report.json             # per-sample RMSD, total and per entity kind
+└── metadata.json
+<output_directory>/<id>_rmsd_guided_runs_summary.json   # guided vs unguided comparison
+```
+
+#### The RMSD trajectory across the diffusion process
+
+Every run records the RMSD at each denoising step the loss is evaluated on and writes
+`diffusion_process/rmsd_trajectory.csv` -- long form, one row per step per sample per
+selection. The breakdown is computed anyway to form the loss, so this costs nothing;
+`track_trajectory` and `trajectory_every_n_steps` control it.
+
+An **unguided** run records no trajectory, because the diffusion loop only calls the loss
+when guidance is on. The baseline curve therefore comes from the third config preparation
+writes, `<id>_rmsd_guided_monitor.yaml`: guidance machinery on with
+`guidance_direction_scale_factor: 0`, so the loss is measured at every step while the
+denoising step itself is untouched -- the direction enters the update as
+`delta + step_size * direction`, and scaling it to zero leaves `delta` exactly as it was.
+
+```bash
+python run_rmsd.py --config generated_configurations/<id>_rmsd_guided.yaml
+python run_rmsd.py --config generated_configurations/<id>_rmsd_guided_monitor.yaml
+
+python scripts/plot_rmsd_trajectory.py \
+    --runs <id> [<id> ...] --output-dir rmsd_pipeline_outputs/<series name>
+```
+
+The plot is one small multiple per dataset, RMSD against denoising step on a log axis, with
+the sampler's own noise level on the top axis so the step index can be read as a noise
+level. Light and dark versions are written as PNG and PDF.
+
+Note the trajectory covers steps `0 .. N-2`: the loop skips the loss on the final step. The
+end-point value for the finished structures is in `rmsd_report.json`.
+
+#### Comparing several datasets
+
+`scripts/collect_rmsd_series.py` gathers a set of runs into one tidy directory -- readable
+tables, a wide CSV and a long-form per-sample CSV, the superposed structures, and the
+pairwise distances between the datasets' own references:
+
+```bash
+python scripts/collect_rmsd_series.py \
+    --guided-configs generated_configurations/*_rmsd_guided.yaml \
+    --output-dir rmsd_pipeline_outputs/<series name>
+```
+
+It looks for each run's unguided counterpart at `<config>_unguided.yaml`, reads the ligand
+occupancy out of each reference to label the dataset, and skips anything with no output.
+
+The reference-to-reference distances matter for reading such a table: two runs aimed at two
+different targets cannot both reach zero, so how far apart the references are is the floor
+for any comparison across datasets.
+
+#### Visualizing against the reference
+
+The structures in `diffusion_process/` are in the **model's own frame**, not the reference
+frame -- the RMSD is computed after an internal superposition, which the coordinates do not
+carry. Loading them straight into a viewer next to the reference will not overlay them.
+
+`scripts/score_rmsd_output.py --write-superposed <dir>` writes each structure moved into the
+reference frame by the whole-structure fit, next to a copy of the reference:
+
+```bash
+python scripts/score_rmsd_output.py generated_configurations/<id>_rmsd_guided.yaml \
+    --write-superposed <output_directory>/<id>_rmsd_guided/superposed
+```
+
+The transform is applied to every atom, so load them without letting the viewer re-fit
+anything -- `align`/`super` would compute its own superposition over a different atom set and
+report a different number from the one above:
+
+```
+# PyMOL
+load superposed/reference.pdb
+load superposed/<id>_0_superposed.pdb
+# no align / super -- the coordinates are already in the reference frame
+rms_cur <id>_0_superposed, reference
+```
+
+Chain naming differs between the two on purpose, and the chain map is what reconciles them:
+the model writes the ligand as its own chain (`C`, residue 1) while a crystal usually has it
+inside a protein chain (here `A`, residue 201).
 
 ## Experiment Tracking
 

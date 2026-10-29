@@ -7,6 +7,7 @@ from ..protenix.data.infer_data_pipeline import get_inference_dataloader
 from ..runner.inference import InferenceRunner
 from ..protenix.utils.torch_utils import to_device
 from .io import AMINO_ACID_ATOMS_ORDER, ATOM_NAME_TO_ELEMENT, create_atom_mask, SEQUENCE_TYPE_TO_ATOM_DICTIONARY, SEQUENCE_TYPE_TO_RESIDUE_KIND
+from .io import entity_topology, entity_atom_count, is_non_polymer_sequence_type
 from ..protenix.data.utils import save_structure_cif
 from tqdm import tqdm
 import os 
@@ -218,29 +219,48 @@ class ProtenixModelManager:
         return aligned_structure
 
     def _generate_msa_configuration(self):
+        """
+            Build the Protenix input JSON for this construct.
+
+            Entity dicts come from config.protein.sequences: polymers carry a one-letter
+            sequence and (for proteins) a precomputed MSA directory, while a ligand or ion
+            carries its specifier -- e.g. "CCD_APR" -- under the same "sequence" key. The
+            two shapes differ in the JSON Protenix expects, so they are built separately:
+            json_parser.build_ligand() reads the specifier from info["ligand"] /
+            info["ion"], not from info["sequence"].
+        """
+        sequences = []
+        for i, sequence_dict in enumerate(self.sequences_dictionary):
+            sequence_type = sequence_dict.get("sequence_type", "proteinChain")
+
+            if is_non_polymer_sequence_type(sequence_type):
+                sequences.append({
+                    sequence_type: {
+                        sequence_type: sequence_dict["sequence"],
+                        "count": sequence_dict["count"],
+                    }
+                })
+                continue
+
+            entity = {
+                "sequence": sequence_dict["sequence"],
+                "count": sequence_dict["count"],
+                "modifications": [],
+            }
+            if sequence_type == "proteinChain":
+                entity["msa"] = {
+                    "precomputed_msa_dir": f"{self.msa_save_dir}/msa/{i+1}",
+                    "pairing_db": "uniref100",
+                }
+            sequences.append({sequence_type: entity})
+
         return [
             {
-                "sequences": [
-                    {
-                        sequence_dict["sequence_type"]: {
-                            "sequence": sequence_dict["sequence"],
-                            "count": sequence_dict["count"],
-                            **({
-                                "msa": {
-                                    "precomputed_msa_dir": f"{self.msa_save_dir}/msa/{i+1}",
-                                    "pairing_db": "uniref100"
-                                }
-                            } if sequence_dict["sequence_type"] == "proteinChain" else {}),
-                            "modifications": []
-                        }
-                    }
-                    for i, sequence_dict in enumerate(self.sequences_dictionary) 
-                ],
+                "sequences": sequences,
                 "modelSeeds": [],
                 "assembly_id": "1" if getattr(self, "assembly_identifier", None) is None else self.assembly_identifier,
                 "name": self.pdb_id
             }
-            
         ]
 
     def _generate_configs(self, device=None):
@@ -551,84 +571,70 @@ class ProtenixModelManager:
 
 
 def save_structure_full(structure, full_sequences, sequence_types, atom_array, write_file_name, bfactors=None, atom_mask=None):
-    
+    """
+        Write one structure out over the model's own atom ordering.
+
+        `full_sequences` / `sequence_types` describe one entity copy per chain, in the
+        same order the model lays its atoms out; a non-polymer entity (ligand / ion)
+        contributes its CCD components and is written as HETATM. Chains are named A, B,
+        C, ... in that order, matching the chain letters the Protenix featurizer assigns.
+    """
     gemmi_structure = gemmi.Structure()
     model = gemmi.Model("1") 
-    
-    chains = []
+
     if atom_mask is None:
         atom_mask = torch.ones(structure.shape[0], dtype=torch.bool)
-    
 
-    for i in range(len(full_sequences)):
-        chains.append(gemmi.Chain(chr(ord("A") + i))) # either just chain A, or chain A,B,C etc. depending on the aligomeric state..!s
-        # TODO: Add the name of the chains to have 1-1 correspondence between the pdb and the chains in the structure 
+    topologies = [
+        entity_topology(full_sequence, sequence_type)
+        for full_sequence, sequence_type in zip(full_sequences, sequence_types)
+    ]
+    expected_atoms = sum(len(atom_names) for topology in topologies for _, atom_names, _ in topology)
+    if expected_atoms != len(atom_mask):
+        raise ValueError(
+            f"save_structure_full: the supplied entities span {expected_atoms} atoms but the "
+            f"mask covers {len(atom_mask)}. The sequences/sequence_types passed in do not "
+            "describe the same topology as the coordinates."
+        )
 
     iter_index = 0
-    
     structure = structure.cpu().detach().numpy()
-    for chain_i, (chain, sequence_type) in enumerate(zip(chains, sequence_types)): 
-        sequence = full_sequences[chain_i]
-        for i, res_name_one_letter in enumerate(sequence): # creating the residue
-            res = gemmi.Residue()
-            res.name =  gemmi.expand_one_letter(res_name_one_letter, SEQUENCE_TYPE_TO_RESIDUE_KIND[sequence_type]) 
-            res.seqid = gemmi.SeqId(i + 1, " ")
-            residue_has_atoms = False  # Track if this residue has any atoms
-            
-            # Every first residue of a dna or rna chain should have the OP3 atom
-            if sequence_type in ["rnaSequence", "dnaSequence"] and i == 0:
-                if atom_mask[iter_index] == True:
-                    atom = gemmi.Atom()
-                    atom.name = "OP3"
-                    atom.element = gemmi.Element("O")
-                    atom.pos = gemmi.Position(*structure[iter_index])
-                    if bfactors is not None:
-                        atom.b_iso = bfactors[iter_index]
-                    res.add_atom(atom)
-                    residue_has_atoms = True
-                    iter_index += 1
+    for chain_i, (topology, sequence_type) in enumerate(zip(topologies, sequence_types)):
+        chain = gemmi.Chain(chr(ord("A") + chain_i)) # either just chain A, or chain A,B,C etc. depending on the aligomeric state..!s
+        is_non_polymer = is_non_polymer_sequence_type(sequence_type)
 
-            
-            for atom_name in SEQUENCE_TYPE_TO_ATOM_DICTIONARY[sequence_type][res.name]: # appending all the atoms in the residue    
-                if atom_mask[iter_index] == True:
+        for residue_i, (res_name, atom_names, elements) in enumerate(topology):
+            res = gemmi.Residue()
+            res.name = res_name
+            res.seqid = gemmi.SeqId(residue_i + 1, " ")
+            if is_non_polymer:
+                res.het_flag = "H"
+            residue_has_atoms = False  # Track if this residue has any atoms
+
+            for atom_name, element in zip(atom_names, elements):
+                if atom_mask[iter_index]:
                     # Save this atom - it's resolved in the structure
                     atom = gemmi.Atom()
                     atom.name = atom_name
-                    atom.element = gemmi.Element(ATOM_NAME_TO_ELEMENT[atom_name])
+                    atom.element = gemmi.Element(element)
                     atom.pos = gemmi.Position(*structure[iter_index])
                     if bfactors is not None:
                         atom.b_iso = bfactors[iter_index]
 
                     res.add_atom(atom)
                     residue_has_atoms = True
-                
+
                 # Always increment iter_index to move through the concatenated mask
                 iter_index += 1
-            
-            # Handle OXT atom for the last residue of each chain
-            if i == len(sequence) - 1 and sequence_type == "proteinChain":  # Last residue in chain
-                if iter_index < len(atom_mask):
-                    if atom_mask[iter_index] == True:
-                        atom = gemmi.Atom()
-                        atom.name = "OXT"
-                        atom.element = gemmi.Element("O")
-                        atom.pos = gemmi.Position(*structure[iter_index])
-                        if bfactors is not None:
-                            atom.b_iso = bfactors[iter_index]
-
-                        res.add_atom(atom)
-                        residue_has_atoms = True
-                    
-                    # Always increment if we're within bounds (whether OXT exists or not)
-                    iter_index += 1
 
             # Only add residue to chain if it has at least one atom
             if residue_has_atoms:
                 chain.add_residue(res)
-    
+
         model.add_chain(chain)
-    
+
     gemmi_structure.add_model(model)
-    
+
     os.makedirs(os.path.dirname(write_file_name), exist_ok=True)
+
     gemmi_structure.write_pdb(write_file_name)

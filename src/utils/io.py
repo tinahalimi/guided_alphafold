@@ -119,6 +119,104 @@ SEQUENCE_TYPE_TO_RESIDUE_KIND = {
     "dnaSequence": gemmi.ResidueKind.DNA,
 }
 
+# ---------------------------------------------------------------------------
+# Entity topology, uniformly for polymers and non-polymers (ligands / ions).
+#
+# The sequence-driven helpers below (create_atom_mask, create_full_element_list,
+# alignment_mask_by_chain, load_pdb_atom_locations_full, save_structure_full) all
+# need the same thing: the ordered list of residues, atom names and elements that
+# one copy of an entity contributes to the model's atom ordering. For polymers
+# that comes from the one-letter sequence; for a ligand it comes from the CCD,
+# which is where Protenix itself gets it. Sharing one implementation is what lets
+# a ligand entity flow through those helpers instead of being silently dropped.
+# ---------------------------------------------------------------------------
+
+#: Entity types whose "sequence" is a ligand specifier (e.g. "CCD_APR") rather
+#: than a one-letter polymer sequence. These mirror the keys Protenix's
+#: json_parser.build_ligand() accepts.
+NON_POLYMER_SEQUENCE_TYPES = ("ligand", "ion")
+
+_LIGAND_TOPOLOGY_CACHE = {}
+
+
+def is_non_polymer_sequence_type(sequence_type: str) -> bool:
+    return sequence_type in NON_POLYMER_SEQUENCE_TYPES
+
+
+def ligand_entity_topology(ligand_specifier: str):
+    """
+        Ordered [(res_name, [atom_name, ...], [element, ...]), ...] for one copy of a
+        ligand entity.
+
+        `ligand_specifier` is what goes into a Protenix input JSON: "CCD_APR", or
+        "CCD_A_B" for a multi-component ligand. Names, elements and their order come
+        straight from the CCD component, so this matches the atom ordering the
+        Protenix featurizer produces for the same entity.
+    """
+    if ligand_specifier not in _LIGAND_TOPOLOGY_CACHE:
+        if not ligand_specifier.startswith("CCD_"):
+            raise ValueError(
+                f"Ligand entity {ligand_specifier!r} is not a CCD specifier. Only CCD_<code> "
+                "ligands have a topology that can be resolved without running the featurizer; "
+                "SMILES / FILE_ ligands are not supported by the sequence-driven helpers."
+            )
+
+        # Imported lazily: the CCD module pulls in rdkit and reads components.cif,
+        # far too heavy to pay for on every `import io`.
+        from ..protenix.data import ccd
+
+        topology = []
+        for code in ligand_specifier[len("CCD_"):].split("_"):
+            component = ccd.get_component_atom_array(
+                code, keep_leaving_atoms=True, keep_hydrogens=False
+            )
+            topology.append((
+                code,
+                [str(name) for name in component.atom_name],
+                [str(element).capitalize() for element in component.element],
+            ))
+        _LIGAND_TOPOLOGY_CACHE[ligand_specifier] = topology
+
+    return deepcopy(_LIGAND_TOPOLOGY_CACHE[ligand_specifier])
+
+
+def entity_topology(sequence: str, sequence_type: str):
+    """
+        Ordered [(res_name, [atom_name, ...], [element, ...]), ...] for one copy of any
+        entity.
+
+        For polymers this reproduces the atom ordering the rest of this module
+        assumes, including the two special positions: OXT closes the last residue of
+        a protein chain, and OP3 opens the first residue of a nucleic chain.
+    """
+    if is_non_polymer_sequence_type(sequence_type):
+        return ligand_entity_topology(sequence)
+
+    residue_kind = SEQUENCE_TYPE_TO_RESIDUE_KIND[sequence_type]
+    atom_dictionary = SEQUENCE_TYPE_TO_ATOM_DICTIONARY[sequence_type]
+
+    topology = []
+    for one_letter_code in sequence:
+        res_name = gemmi.expand_one_letter(one_letter_code, residue_kind)
+        atom_names = list(atom_dictionary[res_name])
+        topology.append((res_name, atom_names, None))
+
+    if topology:
+        if sequence_type == "proteinChain":
+            topology[-1][1].append("OXT")
+        else:  # rnaSequence / dnaSequence
+            topology[0][1].insert(0, "OP3")
+
+    return [
+        (res_name, atom_names, [ATOM_NAME_TO_ELEMENT[name] for name in atom_names])
+        for res_name, atom_names, _ in topology
+    ]
+
+
+def entity_atom_count(sequence: str, sequence_type: str) -> int:
+    """Number of atoms one copy of an entity contributes to the model ordering."""
+    return sum(len(atom_names) for _, atom_names, _ in entity_topology(sequence, sequence_type))
+
 class WandbLogger:
     """
         This class will handle logging to wandb, to make sure that wanbd.log is called only once per iteration
@@ -148,8 +246,13 @@ def load_pdb_atom_locations_full(
         sequence_types=None, 
 ):
     """
-    "sequence_types" is a list of strings, each string being one of the following: "proteinChain", "rnaSequence", "dnaSequence".
+    "sequence_types" is a list of strings, each string being one of the following:
+    "proteinChain", "rnaSequence", "dnaSequence", "ligand", "ion".
     If empty, all the sequences are assumed to be protein chains.
+
+    The returned coordinates are laid out in the model's atom ordering (every atom of
+    every entity, resolved or not), with the companion mask marking which of those
+    slots the pdb actually resolves.
     """
     if sequence_types is None:
         sequence_types = ["proteinChain"] * len(full_sequences)
@@ -168,40 +271,31 @@ def load_pdb_atom_locations_full(
     # 1.0 Cleaning if needed
     try: # hydrogens are being removed regardless.
         structure.remove_hydrogens()
-        structure.remove_ligands_and_waters() # NOTE: DNA is not removed since we are supporting DNA and RNA as input as well
+        # Waters only. Ligands and nucleic acids are supported entity types, so
+        # removing them here would delete atoms the model topology still expects and
+        # leave every downstream mask misaligned against the coordinates.
+        structure.remove_waters()
     except:
-        print("Hydrogens or ligands failed to be removed. Continuing without removing them..!")
+        print("Hydrogens or waters failed to be removed. Continuing without removing them..!")
 
-    # 3. Instantiating the positions and masked depending on the oligomeric state of the protein! We are still going from the fact that the sequence is an oligomer
-    mask = [ 
-        [
-            [[0]] * len(SEQUENCE_TYPE_TO_ATOM_DICTIONARY[sequence_type][ gemmi.expand_one_letter(one_letter_code, SEQUENCE_TYPE_TO_RESIDUE_KIND[sequence_type]) ]) 
-            for one_letter_code in full_sequence 
-        ] for full_sequence, sequence_type in zip(full_sequences, sequence_types)
+    # 2. The per-entity topology fixes the atom ordering: for each entity, an ordered
+    # list of residues, each an ordered list of atom names.
+    topologies = [
+        entity_topology(full_sequence, sequence_type)
+        for full_sequence, sequence_type in zip(full_sequences, sequence_types)
     ]
-    atom_positions_full_perresidue = [ 
-        [
-            [[0,0,0]] * len(SEQUENCE_TYPE_TO_ATOM_DICTIONARY[sequence_type][ gemmi.expand_one_letter(one_letter_code, SEQUENCE_TYPE_TO_RESIDUE_KIND[sequence_type])]) 
-            for one_letter_code in full_sequence 
-        ] for full_sequence, sequence_type in zip(full_sequences, sequence_types)
-    ]
-    
-    # Adding OXT or OP3 to the corresponding places in each chain.
-    for i in range(len(mask)):
-        if sequence_types[i] == "proteinChain":
-            mask[i][-1].append([0]) # adding OXT to each last residue in each chain
-            atom_positions_full_perresidue[i][-1].append([0,0,0]) 
-        elif sequence_types[i] == "rnaSequence":
-            mask[i][0].append([0]) # adding OP3 to each last residue in each chain
-            atom_positions_full_perresidue[i][0].append([0,0,0]) 
-        elif sequence_types[i] == "dnaSequence":
-            mask[i][0].append([0]) # adding OP3 to each last residue in each chain
-            atom_positions_full_perresidue[i][0].append([0,0,0]) 
 
+    # 3. Instantiating the positions and masks over that ordering.
+    mask = [
+        [[[0] for _ in atom_names] for _, atom_names, _ in topology]
+        for topology in topologies
+    ]
+    atom_positions_full_perresidue = [
+        [[[0, 0, 0]] * len(atom_names) for _, atom_names, _ in topology]
+        for topology in topologies
+    ]
     if return_bfacs: # Doing the same for b-factors..!
         b_factors = deepcopy(mask) 
-    if return_elements: # and for elements too..!
-        elements = deepcopy(mask) 
 
     # Preparing the chains 
     # First reading all the chains in the first model
@@ -211,38 +305,76 @@ def load_pdb_atom_locations_full(
     chains = [
         chains[sorted_i] for sorted_i in reordering_indices
     ] 
-    #sequence_types_reordered = [sequence_types[chain_i] for chain_i in reordering_indices]
     # Then only working with the chains that are in the chains_to_read list [assumed alphabetical order]
+    # NOTE: this indexes structure[0] rather than the alphabetically sorted `chains` built
+    # just above, so chains_to_read is in practice interpreted in file order. Preserved as
+    # is -- the other modalities' inputs are already alphabetical, and changing it would
+    # silently re-pick chains for them.
     chains = [structure[0][chain_i] for chain_i in chains_to_read] # we always take the first model, and the according chains of the first model!
 
     # 4. Carefully running the reading cycle
+    unknown_atoms = set()
     for chain_i, chain in enumerate(chains):
-        for residue_i, residue in enumerate(chain): 
+        topology = topologies[chain_i]
+
+        if is_non_polymer_sequence_type(sequence_types[chain_i]):
+            # A non-polymer entity carries no polymer numbering, so its components are
+            # matched by residue name in CCD order rather than by seqid.
+            expected_res_names = [res_name for res_name, _, _ in topology]
+            residues_by_name = {}
+            for residue in chain:
+                residues_by_name.setdefault(residue.name, []).append(residue)
+            component_use_count = {}
+            for residue_index_in_pdb, res_name in enumerate(expected_res_names):
+                # Repeated components (a "CCD_A_A" ligand) consume the pdb's copies of
+                # that residue name in order.
+                copy_index = component_use_count.get(res_name, 0)
+                component_use_count[res_name] = copy_index + 1
+                candidates = residues_by_name.get(res_name, [])
+                if copy_index >= len(candidates):
+                    continue  # this component is not resolved in the pdb
+                residue = candidates[copy_index]
+
+                expected_atom_names = topology[residue_index_in_pdb][1]
+                for atom in residue:
+                    if atom.name not in expected_atom_names:
+                        unknown_atoms.add((residue.name, atom.name))
+                        continue
+                    atom_index_in_pdb = expected_atom_names.index(atom.name)
+                    atom_positions_full_perresidue[chain_i][residue_index_in_pdb][atom_index_in_pdb] = (atom.pos.x, atom.pos.y, atom.pos.z)
+                    mask[chain_i][residue_index_in_pdb][atom_index_in_pdb] = [1]
+                    if return_bfacs:
+                        b_factors[chain_i][residue_index_in_pdb][atom_index_in_pdb] = [atom.b_iso] if atom.b_iso is not None else [0.0]
+            continue
+
+        for residue in chain: 
             residue_index_in_pdb = residue.seqid.num - 1 # converting from the pdb 1-index to the proper 0-index (we go from the assimption that all the )
             if residue_index_in_pdb < 0:
                 continue # Do not include residues with negative indices. 
-            if residue_index_in_pdb >= len(full_sequences[chain_i]):
+            if residue_index_in_pdb >= len(topology):
                 continue
 
-            for atom_i, atom in enumerate(residue):
-                # Finding the correct index of the resolved pdb in the full sequence array. 
-                # DNA and proteinChain have special positions for the last and first and the last atom respectively. These should be taken care of. 
-                if sequence_types[chain_i] == "proteinChain" and atom.name == "OXT":
-                    atom_index_in_pdb = -1
-                elif sequence_types[chain_i] == "rnaSequence" and atom.name == "OP3":
-                    atom_index_in_pdb = 0
-                elif sequence_types[chain_i] == "dnaSequence" and atom.name == "OP3": # NOTE TODO: WE DID NOT CHECK HOW THE DNA SEQUENCES LOOK YET!!
-                    atom_index_in_pdb = 0
-                else:
-                    # If no special position -> we should be able to find the index in the regular way
-                    atom_index_in_pdb = SEQUENCE_TYPE_TO_ATOM_DICTIONARY[sequence_types[chain_i]][residue.name].index(atom.name)
-                
+            # The atom name list already carries the two special positions -- OXT
+            # closing a protein chain, OP3 opening a nucleic one -- so looking the name
+            # up in it is all that is needed.
+            expected_atom_names = topology[residue_index_in_pdb][1]
+            for atom in residue:
+                if atom.name not in expected_atom_names:
+                    unknown_atoms.add((residue.name, atom.name))
+                    continue
+                atom_index_in_pdb = expected_atom_names.index(atom.name)
+
                 atom_positions_full_perresidue[chain_i][residue_index_in_pdb][atom_index_in_pdb] = (atom.pos.x, atom.pos.y, atom.pos.z)
                 mask[chain_i][residue_index_in_pdb][atom_index_in_pdb] = [1]
 
                 if return_bfacs:
                     b_factors[chain_i][residue_index_in_pdb][atom_index_in_pdb] = [atom.b_iso] if atom.b_iso is not None else [0.0] # bfactor is actually never zero..? 
-                
+
+    if unknown_atoms:
+        print(
+            f"WARNING: {len(unknown_atoms)} atom name(s) in {pdb_file} are not part of the "
+            f"expected topology and were skipped, e.g. {sorted(unknown_atoms)[:5]}"
+        )
 
     # 5. Flattening out the resulting arrays (NOW 3D instead of 2D arrays) and importing to torch tensors
     mask = [elem for sublist1 in mask for sublist2 in sublist1 for elem in sublist2]
@@ -265,100 +397,60 @@ def load_pdb_atom_locations_full(
     return to_return
 
 def create_full_element_list(
-        sequences:str, sequence_types: list[str] # the order is already matching
+        sequences, sequence_types: list[str] # the order is already matching
 ):
     """
     Creating full element list in case some elements are unresolved in the original pdb file
     """
-    residue_lists_per_sequence = [
-        [
-            gemmi.expand_one_letter(one_letter_code, SEQUENCE_TYPE_TO_RESIDUE_KIND[sequence_type]) 
-            for one_letter_code in sequence
-        ]
+    atomic_numbers = [
+        gemmi.Element(element).atomic_number
         for sequence, sequence_type in zip(sequences, sequence_types)
-    ]
-    residue_lengths_per_sequence = [
-        [
-            len(SEQUENCE_TYPE_TO_ATOM_DICTIONARY[sequence_type][residue]) 
-            for residue in residue_list
-        ]
-        for residue_list, sequence_type in zip(residue_lists_per_sequence, sequence_types)
-    ]
-    atoms_per_residue_per_sequence = [
-        [
-            SEQUENCE_TYPE_TO_ATOM_DICTIONARY[sequence_type][residue] 
-            for residue in residue_list
-        ]
-        for residue_list, sequence_type in zip(residue_lists_per_sequence, sequence_types)
+        for _, _, elements in entity_topology(sequence, sequence_type)
+        for element in elements
     ]
 
-    atomic_numbers_per_sequence = [
-        [[0,] * length for length in residue_lengths]
-        for residue_lengths in residue_lengths_per_sequence
-    ]
-
-    for i, atoms_per_residue in enumerate(atoms_per_residue_per_sequence):
-        for j, atomic_list in enumerate(atoms_per_residue):
-            for k, atom_name in enumerate(atomic_list): 
-                atomic_numbers_per_sequence[i][j][k] = gemmi.Element(ATOM_NAME_TO_ELEMENT[atom_name]).atomic_number
-        
-        # Adding special residues 
-        if sequence_types[i] == "proteinChain":
-            atomic_numbers_per_sequence[i][-1].append(gemmi.Element("O").atomic_number) # OXT is at the end
-        elif sequence_types[i] == "rnaSequence":
-            atomic_numbers_per_sequence[i][0].insert(0, gemmi.Element("O").atomic_number) # OP3 is at the start
-        elif sequence_types[i] == "dnaSequence":
-            atomic_numbers_per_sequence[i][0].insert(0, gemmi.Element("O").atomic_number)
-
-    atomic_numbers = [item for sublist1 in atomic_numbers_per_sequence for sublist2 in sublist1 for item in sublist2]
-    
     atomic_numbers = torch.tensor(atomic_numbers, dtype=torch.int64).flatten()
 
     return atomic_numbers
 
 def create_atom_mask(
-    sequences: str, regions_of_interest_per_sequence, sequence_types: list[str] # we need specific chains and full sequences in those chains!
+    sequences, regions_of_interest_per_sequence, sequence_types: list[str] # we need specific chains and full sequences in those chains!
     # Note that the order of sequences and sequence_types should be matching...!
 ):
     """
     Create the atom mask for the regions of interest given as a list of residue 1-indices per each full sequence. 
     The reason for requiring supplying the full sequence is due to many pdbs (especially in CryoEM) being uncompletely resolved.
+
+    A non-polymer entity (ligand / ion) has no polymer numbering to select on, so its
+    region of interest is expressed as 1-based indices over its own CCD components;
+    an empty list therefore leaves the whole ligand out of the mask.
     """
-    residue_list_per_sequence = [
-        [
-            gemmi.expand_one_letter(one_letter_code, SEQUENCE_TYPE_TO_RESIDUE_KIND[sequence_type]) 
-            for one_letter_code in sequence
-        ]
-        for sequence, sequence_type in zip(sequences, sequence_types)
-    ]
-    residue_lengths_per_sequence = [
-        [
-            len(SEQUENCE_TYPE_TO_ATOM_DICTIONARY[sequence_type][residue]) 
-            for residue in residue_list
-        ]
-        for residue_list, sequence_type in zip(residue_list_per_sequence, sequence_types)
-    ]
-    
-    masks_per_sequence = [
-        [[0,] * length for length in residue_lengths]
-        for residue_lengths in residue_lengths_per_sequence
-    ]
+    masks_per_sequence = []
+    for sequence, sequence_type in zip(sequences, sequence_types):
+        topology = entity_topology(sequence, sequence_type)
+        masks_per_sequence.append([[0] * len(atom_names) for _, atom_names, _ in topology])
 
     for i, regions_of_interest in enumerate(regions_of_interest_per_sequence):
+        # The chain-terminal slots (OXT closing a protein chain, OP3 opening a nucleic
+        # one) occupy positions in the atom ordering but have never been treated as part
+        # of a residue's region of interest; keep them out so masks stay comparable with
+        # the ones built elsewhere in this module.
+        terminal_slots = {}
+        if sequence_types[i] == "proteinChain":
+            terminal_slots[len(masks_per_sequence[i]) - 1] = {len(masks_per_sequence[i][-1]) - 1}
+        elif not is_non_polymer_sequence_type(sequence_types[i]):
+            terminal_slots[0] = {0}
+
         for interesting_residue in regions_of_interest:
             residue_index = interesting_residue - 1  # convert to 0-index
-            masks_per_sequence[i][residue_index] = [1,] * residue_lengths_per_sequence[i][residue_index] # supplying the full 1-list as all the atoms in the residue are taken
-
-    for i in range(len(sequences)):
-        if sequence_types[i] == "proteinChain":
-            masks_per_sequence[i][-1] = masks_per_sequence[i][-1] + [0] # for OXT
-        elif sequence_types[i] == "rnaSequence":
-            masks_per_sequence[i][0] = [0] + masks_per_sequence[i][0] # for OP3
-        elif sequence_types[i] == "dnaSequence":
-            masks_per_sequence[i][0] = [0] + masks_per_sequence[i][0] # for OP3
+            excluded = terminal_slots.get(residue_index, set())
+            masks_per_sequence[i][residue_index] = [
+                0 if atom_index in excluded else 1
+                for atom_index in range(len(masks_per_sequence[i][residue_index]))
+            ]
 
     mask = [elem for sublist1 in masks_per_sequence for sublist2 in sublist1 for elem in sublist2]  # flattening the mask
-    
+
     mask = torch.tensor(mask, dtype=torch.bool).flatten()
 
     return mask
@@ -688,7 +780,7 @@ def query_msa_server(msa_full_save_dir, sequence_dictionary):
     cache_ok = os.path.exists(msa_full_save_dir)
     if cache_ok:
         for i, entry in enumerate(sequence_dictionary):
-            if entry["sequence_type"] != "proteinChain":
+            if entry.get("sequence_type", "proteinChain") != "proteinChain":
                 continue
             chain_dir = os.path.join(msa_full_save_dir, f"msa/{i+1}")
             non_pairing = os.path.join(chain_dir, "non_pairing.a3m")
@@ -704,7 +796,8 @@ def query_msa_server(msa_full_save_dir, sequence_dictionary):
         os.makedirs(msa_full_save_dir, exist_ok=True)
         # Only protein chain sequences are needed for the MSA
         sequences = [
-            dictionary["sequence"] for dictionary in sequence_dictionary if dictionary["sequence_type"] == "proteinChain"
+            dictionary["sequence"] for dictionary in sequence_dictionary
+            if dictionary.get("sequence_type", "proteinChain") == "proteinChain"
         ] 
         
         # Do paired ONLY if there's more than one unique sequence. 
@@ -739,7 +832,7 @@ def query_msa_server(msa_full_save_dir, sequence_dictionary):
         for i in range(len(sequence_dictionary)): 
             # Saving under the index of the sequence in the sequence dictionary s.t. we can extract the number later on when creating the config
             # Only if a protein sequence.
-            if sequence_dictionary[i]["sequence_type"] == "proteinChain":
+            if sequence_dictionary[i].get("sequence_type", "proteinChain") == "proteinChain":
                 os.makedirs(os.path.join(msa_full_save_dir, f"msa/{i+1}"), exist_ok=True)
 
                 # creating a subfolder for each unique sequence
@@ -1194,22 +1287,10 @@ def alignment_mask_by_chain(sequences, chains_to_align=[0], sequence_types=None)
     if sequence_types is None:
         sequence_types = ["proteinChain"] * len(sequences)
 
-    residue_lists_per_sequence = [
-        [
-            gemmi.expand_one_letter(one_letter_code, SEQUENCE_TYPE_TO_RESIDUE_KIND[sequence_type]) 
-            for one_letter_code in sequence
-        ]
+    atomic_lengths_per_sequence = [
+        entity_atom_count(sequence, sequence_type)
         for sequence, sequence_type in zip(sequences, sequence_types)
     ]
-    residue_lengths_per_sequence = [
-        [
-            len(SEQUENCE_TYPE_TO_ATOM_DICTIONARY[sequence_type][residue]) 
-            for residue in residue_list
-        ]
-        for residue_list, sequence_type in zip(residue_lists_per_sequence, sequence_types)
-    ]
-
-    atomic_lengths_per_sequence = [sum(lengths)+1 for lengths in residue_lengths_per_sequence] # +1 for OXT and OP3
 
     masks_per_sequence = [[0,]*length for length in atomic_lengths_per_sequence]
 

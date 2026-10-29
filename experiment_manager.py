@@ -139,6 +139,7 @@ class ExperimentManager:
         self.heavy_noe_loss_function = None
         self.relax_times_loss_function = None
         self.cryoesp_loss_function = None
+        self.rmsd_loss_function = None
 
         for loss_function_type in self.config.loss_function.loss_function_type:
             if loss_function_type == "density":
@@ -253,6 +254,31 @@ class ExperimentManager:
                 loss_functions.append(loss_function)
                 loss_weight = getattr(cryoesp_config, "weight", 1)
                 weights.append(loss_weight)
+            elif loss_function_type == "rmsd":
+                rmsd_config = self.config.loss_function.rmsd_loss_function
+
+                # An oracle control rather than an experimental likelihood: the target is a
+                # known structure, so everything this needs is the reference, how its chains
+                # line up with the model's, and which atoms to align on and score.
+                loss_function = RMSDGuidanceLossFunction(
+                    atom_array=self.model_manager.atom_array,
+                    reference_pdb=rmsd_config.reference_pdb,
+                    chain_map=rmsd_config.chain_map,
+                    device=self.device,
+                    alignment_selection=getattr(rmsd_config, "alignment_selection", None),
+                    scoring_selection=getattr(rmsd_config, "scoring_selection", None),
+                    objective=getattr(rmsd_config, "objective", "rmsd"),
+                    cache_dir=getattr(rmsd_config, "cache_dir", None),
+                    allowing_reflection=getattr(rmsd_config, "allowing_reflection", False),
+                    require_all_chains_mapped=getattr(rmsd_config, "require_all_chains_mapped", True),
+                    track_trajectory=getattr(rmsd_config, "track_trajectory", True),
+                    trajectory_every_n_steps=getattr(rmsd_config, "trajectory_every_n_steps", 1),
+                )
+                self.rmsd_loss_function = loss_function
+                loss_functions.append(loss_function)
+                loss_weight = getattr(rmsd_config, "weight", 1)
+                weights.append(loss_weight)
+
             else:
                 raise ValueError(f"The loss function {loss_function_type} is not supported!")
 
@@ -320,6 +346,20 @@ class ExperimentManager:
                     os.path.join(verbose_path, f"{name}_{i}.pdb"),
                     bfactors=None,
                 )
+        elif "rmsd" in self.config.loss_function.loss_function_type:
+            # Written over the model's own atom ordering, so the ligand chain lands in the
+            # output alongside the protein rather than being dropped on the way out.
+            for i in range(structures.shape[0]):
+                save_structure_full(
+                    structures[i].cpu(),
+                    self.model_manager.full_sequences,
+                    self.model_manager.sequence_types,
+                    self.model_manager.atom_array,
+                    os.path.join(folder_path, f"{name}_{i}.pdb"),
+                    bfactors=None,
+                )
+            self.rmsd_loss_function.save_state(structures, folder_path)
+
         else:
             raise ValueError(f"The loss function type {self.config.loss_function.loss_function_type} is not a valid option")
 
@@ -464,6 +504,15 @@ class ExperimentManager:
             metadata = {
                 "pdb_id": self.config.protein.pdb_id[:4],
                 "sequences": self.config.protein.sequences,
+            }
+            with open(os.path.join(self.experiment_save_dir, "metadata.json"), "w") as f:
+                json.dump(metadata, f)
+
+        elif self.rmsd_loss_function is not None:
+            metadata = {
+                "pdb_id": self.config.protein.pdb_id,
+                "sequences": self.config.protein.sequences,
+                "reference_pdb": self.config.loss_function.rmsd_loss_function.reference_pdb,
             }
             with open(os.path.join(self.experiment_save_dir, "metadata.json"), "w") as f:
                 json.dump(metadata, f)
